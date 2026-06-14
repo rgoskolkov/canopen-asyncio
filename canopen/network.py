@@ -456,6 +456,7 @@ class MessageListener(Listener):
         if msg.is_error_frame or msg.is_remote_frame:
             return
 
+        logger.debug(f"CAN RX: {msg}")
         try:
             self.network.notify(msg.arbitration_id, msg.data, msg.timestamp)
         except Exception as e:
