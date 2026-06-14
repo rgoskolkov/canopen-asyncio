@@ -93,10 +93,12 @@ class SdoClient(SdoBase):
 
     def request_response(self, sdo_request):
         retries_left = self.MAX_RETRIES
-        if not self.responses.empty():
-            # FIXME: Recreating the queue
-            logger.warning("There were unexpected messages in the queue")
-            self.responses = queue.Queue()
+        while not self.responses.empty():
+            try:
+                stale_response = self.responses.get_nowait()
+                logger.warning("Discarding stale SDO response: %s", stale_response.hex())
+            except queue.Empty:
+                break
         while True:
             self.send_request(sdo_request)
             # Wait for node to respond
