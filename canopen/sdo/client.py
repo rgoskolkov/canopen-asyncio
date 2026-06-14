@@ -315,19 +315,15 @@ class ReadableStream(io.RawIOBase):
                      sdo_client.rx_cobid - 0x600)
         request = bytearray(8)
         SDO_STRUCT.pack_into(request, 0, REQUEST_UPLOAD, index, subindex)
-        response = sdo_client.request_response(request)
+
+        # Robust response handling loop
+        response = self._request_response_for_index(request, index, subindex)
+        
         res_command, res_index, res_subindex = SDO_STRUCT.unpack_from(response)
         res_data = response[4:8]
 
         if res_command & 0xE0 != RESPONSE_UPLOAD:
             raise SdoCommunicationError(f"Unexpected response 0x{res_command:02X}")
-
-        # Check that the message is for us
-        if res_index != index or res_subindex != subindex:
-            raise SdoCommunicationError(
-                f"Node returned a value for {pretty_index(res_index, res_subindex)} instead, "
-                "maybe there is another SDO client communicating "
-                "on the same SDO channel?")
 
         self.exp_data = None
         if res_command & EXPEDITED:
@@ -343,6 +339,40 @@ class ReadableStream(io.RawIOBase):
             logger.debug("Using segmented transfer of %d bytes", self.size)
         else:
             logger.debug("Using segmented transfer")
+
+    def _request_response_for_index(self, request, index, subindex):
+        """Send a request and wait for a response that matches the index/subindex."""
+        self.sdo_client.send_request(request)
+        
+        end_time = time.time() + self.sdo_client.RESPONSE_TIMEOUT
+        while time.time() < end_time:
+            timeout = end_time - time.time()
+            try:
+                response = self.sdo_client.responses.get(block=True, timeout=max(0, timeout))
+            except queue.Empty:
+                # Loop will end due to time limit
+                continue
+
+            res_cmd_byte, res_index, res_subindex = SDO_STRUCT.unpack_from(response)
+
+            # Check if an abort message came for our transaction
+            if res_cmd_byte == RESPONSE_ABORTED and res_index == index and res_subindex == subindex:
+                 abort_code, = struct.unpack_from("<L", response, 4)
+                 raise SdoAbortedError(abort_code)
+            
+            # Check if the response matches the request
+            if res_index == index and res_subindex == subindex:
+                return response
+            else:
+                logger.warning(
+                    "Discarding stale/unexpected SDO response for 0x%04X:%02X while waiting for 0x%04X:%02X",
+                    res_index, res_subindex, index, subindex
+                )
+        
+        # If we exit the loop, it's a timeout
+        self.sdo_client.abort(ABORT_TIMED_OUT)
+        raise SdoCommunicationError(f"No response received for {pretty_index(index, subindex)}")
+
 
     def read(self, size=-1):
         """Read one segment which may be up to 7 bytes.
@@ -365,7 +395,12 @@ class ReadableStream(io.RawIOBase):
         command |= self._toggle
         request = bytearray(8)
         request[0] = command
+
+        # Since we can't know the index/subindex for a segment response, we can't use the robust handler.
+        # We rely on the fact that segmented transfers are locked by the SDO client lock.
+        # The initial queue clearing in request_response should handle most stale messages.
         response = self.sdo_client.request_response(request)
+
         res_command, = struct.unpack_from("B", response)
         if res_command & 0xE0 != RESPONSE_SEGMENT_UPLOAD:
             self.sdo_client.abort(ABORT_INVALID_COMMAND_SPECIFIER)
